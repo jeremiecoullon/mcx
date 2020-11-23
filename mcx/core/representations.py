@@ -6,6 +6,7 @@ compiled to the CST.
 
 """
 from collections import defaultdict
+import copy
 from functools import partial
 from typing import Dict
 
@@ -15,6 +16,7 @@ from mcx.core.compiler import compile_graph
 from mcx.core.graph import GraphicalModel
 from mcx.core.nodes import Op, Placeholder, SampleOp
 
+
 # -------------------------------------------------------
 #                    == LOGPDF ==
 # --------------------------------------------------------
@@ -22,6 +24,7 @@ from mcx.core.nodes import Op, Placeholder, SampleOp
 
 def logpdf(graph: GraphicalModel, namespace: Dict):
     """Returns a function that compute the model's logpdf."""
+    graph = copy.deepcopy(graph)
 
     # Create a new 'logpdf' node that is the sum of the individual variables'
     # contributions.
@@ -44,11 +47,11 @@ def logpdf(graph: GraphicalModel, namespace: Dict):
 
     sum_node = Op(to_ast, graph.name, "logpdf")
 
-    graph = _logpdf_core(graph, namespace)
+    graph = _logpdf_core(graph)
     logpdf_contribs = [node for node in graph if isinstance(node, SampleOp)]
     graph.add(sum_node, *logpdf_contribs)
 
-    return compile_graph(graph, namespace)
+    return compile_graph(graph, namespace, f"{graph.name}_logpdf")
 
 
 def logpdf_contributions(graph: GraphicalModel, namespace: Dict):
@@ -65,6 +68,8 @@ def logpdf_contributions(graph: GraphicalModel, namespace: Dict):
     and scope name) at compilation.
 
     """
+    graph = copy.deepcopy(graph)
+
     logpdf_contribs = [node for node in graph if isinstance(node, SampleOp)]
 
     def to_ast(*_):
@@ -85,7 +90,8 @@ def logpdf_contributions(graph: GraphicalModel, namespace: Dict):
             return cst.Dict(
                 [
                     cst.DictElement(
-                        cst.Name(value=var_name), cst.Name(value=contrib_name)
+                        key=cst.SimpleString(value=f"'{var_name}'"),
+                        value=cst.Name(value=contrib_name),
                     )
                     for var_name, contrib_name in scoped[scope].items()
                 ]
@@ -96,11 +102,12 @@ def logpdf_contributions(graph: GraphicalModel, namespace: Dict):
         return cst.Dict(
             [
                 cst.DictElement(
-                    cst.Name(value=scope),
+                    cst.SimpleString(value=f"'{scope}'"),
                     cst.Dict(
                         [
                             cst.DictElement(
-                                cst.Name(value=var_name), cst.Name(value=contrib_name)
+                                key=cst.SimpleString(value=f"'{var_name}'"),
+                                value=cst.Name(value=contrib_name),
                             )
                             for var_name, contrib_name in scoped[scope].items()
                         ]
@@ -112,13 +119,13 @@ def logpdf_contributions(graph: GraphicalModel, namespace: Dict):
 
     tuple_node = Op(to_ast, graph.name, "logpdf_contributions")
 
-    graph = _logpdf_core(graph, namespace)
+    graph = _logpdf_core(graph)
     graph.add(tuple_node, *logpdf_contribs)
 
-    return compile_graph(graph, namespace)
+    return compile_graph(graph, namespace, f"{graph.name}_logpdf_contribs")
 
 
-def _logpdf_core(graph: GraphicalModel, namespace: Dict):
+def _logpdf_core(graph: GraphicalModel):
     """Transform the SampleOps to statements that compute the logpdf associated
     with the variables' values.
     """
@@ -126,7 +133,6 @@ def _logpdf_core(graph: GraphicalModel, namespace: Dict):
     sample = []
 
     def to_logpdf(to_ast, *args, **kwargs):
-        print(args, kwargs)
         name = kwargs.pop("var_name")
         return cst.Call(
             func=cst.Attribute(value=to_ast(*args, **kwargs), attr=cst.Name("logpdf")),
@@ -136,7 +142,7 @@ def _logpdf_core(graph: GraphicalModel, namespace: Dict):
     def to_placeholder_ast(name: str):
         return cst.Param(name=cst.Name(value=name))
 
-    for node in graph.nodes():
+    for node in reversed(list(graph.nodes())):
         if not isinstance(node, SampleOp):
             continue
 
@@ -167,8 +173,101 @@ def _logpdf_core(graph: GraphicalModel, namespace: Dict):
 
         for e in to_remove:
             graph.remove_edge(*e)
-    # Here we need to change the function return
-    # 1 - Tuple logpdf_1, logpdf_2, etc. for logpdf contribs
-    # 2 - Sum of logpdfs otherwise
+
+    return graph
+
+
+# -------------------------------------------------------
+#                    == SAMPLING ==
+# --------------------------------------------------------
+
+
+def sample(graph: GraphicalModel, namespace: Dict):
+    """Execute the generative model."""
+    graph = copy.deepcopy(graph)
+    graph = _sampler_core(graph)
+    return compile_graph(graph, namespace, f"{graph.name}_sample")
+
+
+def sample_forward(graph: GraphicalModel, namespace: Dict):
+    """Obtain forward samples from the multivariate distribution implied by the model."""
+    graph = copy.deepcopy(graph)
+
+    random_variables = [node for node in graph if isinstance(node, SampleOp)]
+
+    def to_ast(*_):
+        scopes = [rv.scope for rv in random_variables]
+        names = [rv.name for rv in random_variables]
+
+        scoped = defaultdict(dict)
+        for scope, var_name, var in zip(scopes, names, random_variables):
+            scoped[scope][var_name] = var
+
+        # if there is only one scope (99% of models) we return a flat dictionary
+        if len(set(scopes)) == 1:
+            scope = scopes[0]
+            return cst.Dict(
+                [
+                    cst.DictElement(
+                        key=cst.SimpleString(value=f"'{var_name}'"),
+                        value=cst.Name(value=var.name)
+                    )
+                    for var_name, var in scoped[scope].items()
+                ]
+            )
+
+        # Otherwise we return a nested dictionary where the first level is
+        # the scope, and then the variables.
+        return cst.Dict(
+            [
+                cst.DictElement(
+                    cst.SimpleString(value=f"'{scope}'"),
+                    cst.Dict(
+                        [
+                            cst.DictElement(
+                                key=cst.SimpleString(value=f"'{var_name}'"),
+                                value=cst.Name(value=var.name)
+                            )
+                            for var_name, var in scoped[scope].items()
+                        ]
+                    ),
+                )
+                for scope in scoped.keys()
+            ]
+        )
+
+    tuple_node = Op(to_ast, graph.name, "forward_samples")
+
+    graph = _sampler_core(graph)
+    graph.add(tuple_node, *random_variables)
+    return compile_graph(graph, namespace, f"{graph.name}_sample_forward")
+
+
+def _sampler_core(graph: GraphicalModel):
+    """Transform the SampleOps to statements that compute the logpdf associated
+    with the variables' values.
+    """
+
+    rng_node = Placeholder("rng_key", lambda: cst.Param(name=cst.Name(value="rng_key")))
+
+    # Update the SampleOps to return a sample from the distribution
+    def to_sampler(to_ast, *args, **kwargs):
+        rng_key = kwargs.pop("rng_key")
+        return cst.Call(
+            func=cst.Attribute(value=to_ast(*args, **kwargs), attr=cst.Name("sample")),
+            args=[cst.Arg(value=rng_key)],
+        )
+
+    random_variables = []
+    for node in reversed(list(graph.nodes())):
+        if not isinstance(node, SampleOp):
+            continue
+        node.to_ast = partial(to_sampler, node.to_ast)
+        random_variables.append(node)
+
+    # Add the placeholders to the graph
+    graph.add(rng_node)
+    for var in random_variables:
+        graph.add_edge(rng_node, var, type="kwargs", key=["rng_key"])
 
     return graph

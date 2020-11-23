@@ -14,14 +14,13 @@ import inspect
 import textwrap
 from collections import defaultdict
 from functools import partial
-from typing import Callable, Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Union, Any
 
 import libcst as cst
 import mcx
 import networkx as nx
 from mcx.core.graph import GraphicalModel
 from mcx.core.nodes import Constant, Name, Op, Placeholder, SampleOp
-
 
 MODEL_BADLY_FORMED_ERROR = SyntaxError(
     "A MCX model should be defined in a single function. This exception is completely unexpected."
@@ -34,8 +33,19 @@ MULTIPLE_RETURNED_VALUES_ERROR = SyntaxError(
 )
 
 
-def parse(model_fn: Callable) -> GraphicalModel:
-    """Parse the model definition to build a graphical model."""
+def parse(model_fn: Any) -> GraphicalModel:
+    """Parse the model definition to build a graphical model.
+
+    Parameter
+    ---------
+    model
+        A live function object that contains the model definition.
+
+    Returns
+    -------
+    The intermediate representation of the model.
+
+    """
     source = inspect.getsource(model_fn)
     source = textwrap.dedent(source)  # not sure we need this now
     tree = cst.parse_module(source)
@@ -117,7 +127,9 @@ class ModelDefinitionParser(cst.CSTVisitor):
 
     def __init__(self, namespace: Dict):
         self.current_scope = None  # name of the current model
-        self.scopes: Dict = defaultdict(int)  # number of times each scope has been encountered
+        self.scopes: Dict = defaultdict(
+            int
+        )  # number of times each scope has been encountered
         self.namespace = namespace
 
         self.sample_this_op = True
@@ -201,7 +213,7 @@ class ModelDefinitionParser(cst.CSTVisitor):
         self.graph.name = node.name.value
         self.scope = node.name.value
 
-        def to_ast(name, default):
+        def to_ast(name, default=None):
             return cst.Param(
                 name=cst.Name(value=name),
                 default=default,
@@ -210,10 +222,14 @@ class ModelDefinitionParser(cst.CSTVisitor):
         function_args = node.params.params
         for i, argument in enumerate(function_args):
             name = argument.name.value
-            default = argument.default
-            node = Placeholder(name, partial(to_ast, name, default))
+            node = Placeholder(name, partial(to_ast, name))
             self.named_variables[name] = node
-            self.graph.add(node)
+
+            try:
+                default = self.recursive_visit(argument.default)
+                self.graph.add(node, default)
+            except TypeError:
+                self.graph.add(node)
 
     def visit_SimpleStatementLine(self, node: cst.SimpleStatementLine) -> None:
         """Read comments.
@@ -333,9 +349,12 @@ class ModelDefinitionParser(cst.CSTVisitor):
             fn_call_path = unroll_call_path(comparator.expression.func)
             fn_obj = eval(fn_call_path, self.namespace)
             if isinstance(fn_obj, mcx.model):
-                sample_op = self.graph.merge(
-                    variable_name, fn_obj.graph
+                posargs = [self.recursive_visit(arg) for arg in comparator.expression.args if not arg.keyword]
+                kwargs = {arg.keyword: self.recursive_visit(arg) for arg in comparator.expression.args if arg.keyword}
+                merged_graph, sample_op = self.graph.merge(
+                    variable_name, posargs, kwargs, fn_obj.graph
                 )  # returns the return Op
+                self.graph = merged_graph
             else:
                 op = self.recursive_visit(comparator.expression)
                 sample_op = SampleOp(variable_name, self.scope, op.to_ast)
@@ -511,11 +530,14 @@ class ModelDefinitionParser(cst.CSTVisitor):
         """We currently return all the leaves of the (directed) graph when
         calling the function, in the order in which they appear. The return
         statement has thus no effect on how the graph is processed.
-
-        TODO: Tag the returned variables to be able to return them in function
-        calls.
-
         """
+        value = node.value
+        if not isinstance(value, cst.Name):
+            raise MULTIPLE_RETURNED_VALUES_ERROR
+
+        returned_name = node.value.value
+        returned_node = self.named_variables[returned_name]
+        returned_node.is_returned = True
 
     # ----------------------------------------------------------------
     #           EXPLICITLY EXCLUDE CONTROL FLOW (for now)

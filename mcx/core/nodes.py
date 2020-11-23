@@ -15,7 +15,7 @@ class Constant(object):
 
 
 class Name(object):
-    """This is temporarily here to handle the attributes. Will disappear 
+    """This is temporarily here to handle the attributes. Will disappear
     eventually.
     """
 
@@ -63,12 +63,18 @@ class Op(object):
     """
 
     def __init__(
-        self, ast_generator, scope: Optional[str], name: Optional[str] = None, do_sample: bool = False
+        self,
+        ast_generator,
+        scope: Optional[str],
+        name: Optional[str] = None,
+        do_sample: bool = False,
+        is_returned=False,
     ) -> None:
         self.name = name
         self.scope = scope
         self.to_ast = ast_generator
         self.do_sample = False
+        self.is_returned = False
 
 
 class SampleOp(Op):
@@ -78,7 +84,10 @@ class SampleOp(Op):
     are necessarily named.
     """
 
-    def __init__(self, name: str, scope: str, ast_generator: Callable) -> None:
+    def __init__(
+        self, name: str, scope: str, ast_generator: Callable, is_returned=False
+    ) -> None:
         self.name = name
         self.scope = scope
         self.to_ast = ast_generator
+        self.is_returned = False
